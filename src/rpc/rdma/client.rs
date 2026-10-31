@@ -148,19 +148,36 @@ pub async fn parse_response(conn: Arc<Conn>, pool: Arc<CallbackPool>) {
         }
         debug!("parse_response: lock success");
 
-        parse_response_body(
-            response,
-            pool.get_meta_data_ref(id, header.meta_data_length as usize),
-            pool.get_data_ref(id, header.data_length as usize),
-        );
+        let meta_data_length = header.meta_data_length as usize;
+        let data_length = header.data_length as usize;
+        // The lengths in the header are peer controlled: only accept them when they fit
+        // into the buffers that were registered together with this callback.
+        let meta_data = match pool.get_meta_data_ref(id, meta_data_length) {
+            Ok(meta_data) => meta_data,
+            Err(e) => {
+                error!("parse_response: invalid meta data length: {}", e);
+                conn.release(response).await;
+                continue;
+            }
+        };
+        let data = match pool.get_data_ref(id, data_length) {
+            Ok(data) => data,
+            Err(e) => {
+                error!("parse_response: invalid data length: {}", e);
+                conn.release(response).await;
+                continue;
+            }
+        };
+
+        parse_response_body(response, meta_data, data);
         conn.release(response).await;
         if let Err(e) = pool
             .response(
                 id,
                 header.status,
                 header.flags,
-                header.meta_data_length as usize,
-                header.data_length as usize,
+                meta_data_length,
+                data_length,
             )
             .await
         {

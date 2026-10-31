@@ -128,7 +128,13 @@ impl MetaEngine {
         for file_name in self.file_attr_db.db.iterator(IteratorMode::Start) {
             let (k, v) = file_name.unwrap();
             let k = String::from_utf8(k.to_vec()).unwrap();
-            let attr = bytes_as_file_attr(&v);
+            let attr = match bytes_as_file_attr(&v) {
+                Some(attr) => attr,
+                None => {
+                    error!("init: invalid file attr for {}, skipped", k);
+                    continue;
+                }
+            };
             let file_type = attr.kind;
             match file_type {
                 FileType::RegularFile => {
@@ -136,7 +142,7 @@ impl MetaEngine {
                     self.file_indexs.insert(
                         k,
                         FileIndex {
-                            file_attr: *attr,
+                            file_attr: attr,
                             status: 0,
                             sub_files_num: AtomicU32::new(0),
                         },
@@ -147,7 +153,7 @@ impl MetaEngine {
                     self.file_indexs.insert(
                         k.clone(),
                         FileIndex {
-                            file_attr: *attr,
+                            file_attr: attr,
                             status: 0,
                             sub_files_num: AtomicU32::new(INIT_SUB_FILES_NUM),
                         },

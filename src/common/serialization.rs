@@ -81,7 +81,8 @@ impl TryFrom<u32> for OperationType {
             22 => Ok(OperationType::ListVolumes),
             23 => Ok(OperationType::DeleteVolume),
             24 => Ok(OperationType::CleanVolume),
-            _ => panic!("Unkown value: {}", value),
+            // operation types come from the network, never panic on an unknown one
+            _ => Err(()),
         }
     }
 }
@@ -140,7 +141,8 @@ impl TryFrom<u32> for ManagerOperationType {
             107 => Ok(ManagerOperationType::RemoveNodes),
             108 => Ok(ManagerOperationType::UpdateServerStatus),
             109 => Ok(ManagerOperationType::FinishServer),
-            _ => panic!("Unkown value: {}", value),
+            // operation types come from the network, never panic on an unknown one
+            _ => Err(()),
         }
     }
 }
@@ -472,31 +474,77 @@ impl From<FileTypeSimple> for u8 {
 }
 
 pub fn file_attr_as_bytes(attr: &FileAttr) -> &[u8] {
-    unsafe {
+    let bytes = unsafe {
         let ptr = attr as *const FileAttr as *const u8;
         std::slice::from_raw_parts(ptr, std::mem::size_of::<FileAttr>())
-    }
+    };
+    debug_assert_eq!(bytes.len(), std::mem::size_of::<FileAttr>());
+    bytes
 }
 
 pub fn file_attr_as_bytes_mut(attr: &mut FileAttr) -> &mut [u8] {
-    unsafe {
+    let bytes = unsafe {
         let ptr = attr as *mut FileAttr as *mut u8;
         std::slice::from_raw_parts_mut(ptr, std::mem::size_of::<FileAttr>())
-    }
+    };
+    debug_assert_eq!(bytes.len(), std::mem::size_of::<FileAttr>());
+    bytes
 }
 
-pub fn bytes_as_file_attr(bytes: &[u8]) -> &FileAttr {
-    unsafe {
-        let ptr = bytes.as_ptr() as *const FileAttr;
-        &*ptr
-    }
+/// Number of valid `fuser::FileType` discriminants.
+const FILE_TYPE_VARIANTS: u32 = 7;
+
+/// Offset of the `kind` field inside `FileAttr`, computed without reading memory.
+fn file_attr_kind_offset() -> usize {
+    let attr = std::mem::MaybeUninit::<FileAttr>::uninit();
+    let base = attr.as_ptr();
+    // SAFETY: `addr_of!` only computes the address of the field, it never dereferences it.
+    unsafe { (std::ptr::addr_of!((*base).kind) as usize) - (base as usize) }
 }
 
-pub fn bytes_as_file_attr_mut(bytes: &mut [u8]) -> &mut FileAttr {
-    unsafe {
-        let ptr = bytes.as_mut_ptr() as *mut FileAttr;
-        &mut *ptr
+/// Check that the serialized `kind` field holds a valid `FileType` discriminant.
+fn has_valid_file_type(bytes: &[u8]) -> bool {
+    let kind_offset = file_attr_kind_offset();
+    let kind_size = std::mem::size_of::<FileType>();
+    let mut raw = 0u32;
+    for (index, byte) in bytes[kind_offset..kind_offset + kind_size]
+        .iter()
+        .enumerate()
+    {
+        raw |= (*byte as u32) << (8 * index);
     }
+    raw < FILE_TYPE_VARIANTS
+}
+
+/// Interpret metadata received from the network as a `FileAttr`.
+///
+/// Returns `None` unless `bytes` has exactly the size of a serialized `FileAttr`
+/// and carries a valid `kind` discriminant. The attribute is copied out of the
+/// buffer, so the result does not depend on the alignment of `bytes`.
+pub fn bytes_as_file_attr(bytes: &[u8]) -> Option<FileAttr> {
+    if bytes.len() != std::mem::size_of::<FileAttr>() || !has_valid_file_type(bytes) {
+        return None;
+    }
+    // SAFETY: the length and the discriminant of `kind` have been validated, and
+    // `read_unaligned` accepts an arbitrarily aligned source pointer. `FileAttr` is a
+    // plain value type, so it is moved out of the buffer instead of borrowed from it.
+    Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const FileAttr) })
+}
+
+/// Mutable variant of [`bytes_as_file_attr`]. Requires the buffer to be aligned,
+/// because the attribute is borrowed in place.
+pub fn bytes_as_file_attr_mut(bytes: &mut [u8]) -> Option<&mut FileAttr> {
+    if bytes.len() != std::mem::size_of::<FileAttr>() || !has_valid_file_type(bytes) {
+        return None;
+    }
+    let ptr = bytes.as_mut_ptr();
+    if (ptr as usize) % std::mem::align_of::<FileAttr>() != 0 {
+        return None;
+    }
+    // SAFETY: the length and alignment have been checked and `kind` holds a valid
+    // discriminant, so the cast produces a well-formed `FileAttr` covering exactly the
+    // borrowed buffer.
+    Some(unsafe { &mut *(ptr as *mut FileAttr) })
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -557,21 +605,25 @@ impl FileAttrSimple {
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        unsafe {
+        let bytes = unsafe {
             std::slice::from_raw_parts(
                 self as *const FileAttrSimple as *const u8,
                 std::mem::size_of::<FileAttrSimple>(),
             )
-        }
+        };
+        debug_assert_eq!(bytes.len(), std::mem::size_of::<FileAttrSimple>());
+        bytes
     }
 
     pub fn as_mut_bytes(&mut self) -> &mut [u8] {
-        unsafe {
+        let bytes = unsafe {
             std::slice::from_raw_parts_mut(
                 self as *mut FileAttrSimple as *mut u8,
                 std::mem::size_of::<FileAttrSimple>(),
             )
-        }
+        };
+        debug_assert_eq!(bytes.len(), std::mem::size_of::<FileAttrSimple>());
+        bytes
     }
 
     // pub fn to_bytes(attr: &FileAttrSimple) -> Vec<u8> {
@@ -890,5 +942,57 @@ impl Display for Volume {
             "Volume {{ name: {}, size: {}, used_size: {} }}",
             self.name, self.size, self.used_size
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::util::empty_file;
+
+    #[test]
+    fn test_unknown_operation_types_are_rejected() {
+        assert!(OperationType::try_from(25).is_err());
+        assert!(OperationType::try_from(u32::MAX).is_err());
+        assert!(ManagerOperationType::try_from(0).is_err());
+        assert!(ManagerOperationType::try_from(u32::MAX).is_err());
+    }
+
+    #[test]
+    fn test_bytes_as_file_attr_rejects_wrong_length() {
+        let attr = empty_file();
+        let bytes = file_attr_as_bytes(&attr).to_vec();
+        assert_eq!(bytes.len(), std::mem::size_of::<FileAttr>());
+
+        // exact length round trips
+        let restored = bytes_as_file_attr(&bytes).unwrap();
+        assert_eq!(file_attr_as_bytes(&restored), bytes.as_slice());
+        // truncated and oversized metadata must not be reinterpreted
+        assert!(bytes_as_file_attr(&[]).is_none());
+        assert!(bytes_as_file_attr(&bytes[..bytes.len() - 1]).is_none());
+        assert!(bytes_as_file_attr(&bytes[..1]).is_none());
+        let mut oversized = bytes.clone();
+        oversized.push(0);
+        assert!(bytes_as_file_attr(&oversized).is_none());
+    }
+
+    #[test]
+    fn test_bytes_as_file_attr_rejects_invalid_kind() {
+        let mut bytes = file_attr_as_bytes(&empty_file()).to_vec();
+        let kind_offset = file_attr_kind_offset();
+        for index in 0..std::mem::size_of::<FileType>() {
+            bytes[kind_offset + index] = 0xff;
+        }
+        assert!(bytes_as_file_attr(&bytes).is_none());
+    }
+
+    #[test]
+    fn test_bytes_as_file_attr_mut_requires_length_and_alignment() {
+        let mut buffer = vec![0u8; std::mem::size_of::<FileAttr>()];
+        assert!(bytes_as_file_attr_mut(&mut buffer[..1]).is_none());
+
+        let mut attr = empty_file();
+        let bytes = file_attr_as_bytes_mut(&mut attr);
+        assert!(bytes_as_file_attr_mut(bytes).is_some());
     }
 }

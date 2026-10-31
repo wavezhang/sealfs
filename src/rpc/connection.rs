@@ -5,8 +5,8 @@
 use std::{io::IoSlice, marker::PhantomData, sync::atomic::AtomicU32};
 
 use super::protocol::{
-    RequestHeader, ResponseHeader, MAX_DATA_LENGTH, MAX_FILENAME_LENGTH, MAX_METADATA_LENGTH,
-    REQUEST_HEADER_SIZE, RESPONSE_HEADER_SIZE,
+    RequestHeader, ResponseHeader, MAX_COPY_LENGTH, MAX_DATA_LENGTH, MAX_FILENAME_LENGTH,
+    MAX_METADATA_LENGTH, REQUEST_HEADER_SIZE, RESPONSE_HEADER_SIZE,
 };
 use log::{error, info};
 use tokio::{
@@ -196,8 +196,15 @@ impl<W: AsyncWriteExt + Unpin, R: AsyncReadExt + Unpin> ClientConnection<W, R> {
         read_stream: &mut R,
         total_length: u32,
     ) -> Result<(), String> {
-        let mut buffer = vec![0u8; total_length as usize];
-        self.receive(read_stream, &mut buffer).await?;
+        // `total_length` comes from the peer, so never allocate it up front: drain the
+        // body with a fixed size buffer instead.
+        let mut buffer = [0u8; MAX_COPY_LENGTH];
+        let mut remaining = total_length as usize;
+        while remaining > 0 {
+            let chunk = std::cmp::min(remaining, buffer.len());
+            self.receive(read_stream, &mut buffer[..chunk]).await?;
+            remaining -= chunk;
+        }
         Ok(())
     }
 }

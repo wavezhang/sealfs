@@ -603,6 +603,16 @@ where
         data: Vec<u8>,
         metadata: Vec<u8>,
     ) -> Result<(i32, u32, usize, usize, Vec<u8>, Vec<u8>), i32> {
+        let r#type = match OperationType::try_from(operation_type) {
+            Ok(r#type) => r#type,
+            Err(_) => {
+                error!(
+                    "forward request: unknown operation type: {}",
+                    operation_type
+                );
+                return Err(libc::EINVAL);
+            }
+        };
         let (
             mut status,
             mut rsp_flags,
@@ -610,9 +620,15 @@ where
             mut recv_data_length,
             mut recv_meta_data,
             mut recv_data,
-        ) = match operation_type.try_into().unwrap() {
-            OperationType::Unkown => todo!(),
-            OperationType::Lookup => todo!(),
+        ) = match r#type {
+            // forwarding Unkown/Lookup is not implemented, report it instead of panicking
+            OperationType::Unkown | OperationType::Lookup => {
+                error!(
+                    "forward request: unsupported operation type: {}",
+                    operation_type
+                );
+                return Err(libc::EINVAL);
+            }
             OperationType::CreateFile => (0, 0, 0, 0, vec![0; 1024], vec![]),
             OperationType::CreateDir => (0, 0, 0, 0, vec![0; 1024], vec![]),
             OperationType::GetFileAttr => (0, 0, 0, 0, vec![0; 1024], vec![]),
@@ -620,7 +636,13 @@ where
             OperationType::OpenFile => (0, 0, 0, 0, vec![], vec![]),
             OperationType::ReadFile => {
                 let unwraped_meta_data =
-                    bincode::deserialize::<ReadFileSendMetaData>(&metadata).unwrap();
+                    match bincode::deserialize::<ReadFileSendMetaData>(&metadata) {
+                        Ok(meta_data) => meta_data,
+                        Err(e) => {
+                            error!("forward request: invalid read file metadata: {}", e);
+                            return Err(libc::EINVAL);
+                        }
+                    };
                 (
                     0,
                     0,

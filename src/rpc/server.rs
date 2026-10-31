@@ -91,16 +91,20 @@ pub async fn receive<
                 Err(e) => {
                     if e == "early eof" || e == "Connection reset by peer (os error 104)" {
                         warn!("{:?} receive, connection closed", id);
-                        break;
+                    } else {
+                        // a malformed header is a protocol error, drop the connection
+                        // instead of panicking in the connection task
+                        error!("{:?} parse_request, header error: {}", id, e);
                     }
-                    panic!("{:?} parse_request, header error: {}", id, e);
+                    break;
                 }
             };
             let data_result = connection.receive_request(&mut read_stream, &header).await;
             let (path, data, metadata) = match data_result {
                 Ok(data) => data,
                 Err(e) => {
-                    panic!("{:?} parse_request, data error: {}", id, e);
+                    error!("{:?} parse_request, data error: {}", id, e);
+                    break;
                 }
             };
             let handler = handler.clone();
