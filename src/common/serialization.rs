@@ -941,16 +941,6 @@ pub struct Volume {
     pub used_size: u64,
 }
 
-impl Display for Volume {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Volume {{ name: {}, size: {}, used_size: {} }}",
-            self.name, self.size, self.used_size
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1056,5 +1046,15 @@ mod tests {
             dirent_record_len(name_offset, trailer, 4, usize::MAX, usize::MAX),
             None
         );
+    }
+}
+
+impl Display for Volume {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Volume {{ name: {}, size: {}, used_size: {} }}",
+            self.name, self.size, self.used_size
+        )
     }
 }
