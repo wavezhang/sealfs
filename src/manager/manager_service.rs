@@ -182,8 +182,18 @@ impl Handler for ManagerService {
         path: Vec<u8>,
         _data: Vec<u8>,
         metadata: Vec<u8>,
+        authenticated: bool,
     ) -> anyhow::Result<(i32, u32, usize, usize, Vec<u8>, Vec<u8>)> {
-        let r#type = ManagerOperationType::try_from(operation_type).unwrap();
+        let r#type = match ManagerOperationType::try_from(operation_type) {
+            Ok(value) => value,
+            Err(e) => {
+                error!(
+                    "connection {} sent invalid manager operation type {}: {:?}",
+                    id, operation_type, e
+                );
+                return Ok((libc::EINVAL, 0, 0, 0, Vec::new(), Vec::new()));
+            }
+        };
         match r#type {
             ManagerOperationType::GetClusterStatus => {
                 let status = self.manager.get_cluster_status();
@@ -238,9 +248,21 @@ impl Handler for ManagerService {
                 }
             },
             ManagerOperationType::AddNodes => {
-                let new_servers_info = bincode::deserialize::<AddNodesSendMetaData>(&metadata)
-                    .unwrap()
-                    .new_servers_info;
+                if !authenticated {
+                    error!(
+                        "connection {} rejected unauthenticated AddNodes request",
+                        id
+                    );
+                    return Ok((libc::EACCES, 0, 0, 0, Vec::new(), Vec::new()));
+                }
+                let new_servers_info = match bincode::deserialize::<AddNodesSendMetaData>(&metadata)
+                {
+                    Ok(value) => value.new_servers_info,
+                    Err(e) => {
+                        error!("connection {} sent malformed AddNodes metadata: {}", id, e);
+                        return Ok((libc::EINVAL, 0, 0, 0, Vec::new(), Vec::new()));
+                    }
+                };
                 info!("connection {} add nodes: {:?}", id, new_servers_info);
                 match self.manager.add_nodes(new_servers_info) {
                     None => Ok((0, 0, 0, 0, Vec::new(), Vec::new())),
@@ -251,10 +273,24 @@ impl Handler for ManagerService {
                 }
             }
             ManagerOperationType::RemoveNodes => {
+                if !authenticated {
+                    error!(
+                        "connection {} rejected unauthenticated RemoveNodes request",
+                        id
+                    );
+                    return Ok((libc::EACCES, 0, 0, 0, Vec::new(), Vec::new()));
+                }
                 let deleted_servers_info =
-                    bincode::deserialize::<DeleteNodesSendMetaData>(&metadata)
-                        .unwrap()
-                        .deleted_servers_info;
+                    match bincode::deserialize::<DeleteNodesSendMetaData>(&metadata) {
+                        Ok(value) => value.deleted_servers_info,
+                        Err(e) => {
+                            error!(
+                                "connection {} sent malformed RemoveNodes metadata: {}",
+                                id, e
+                            );
+                            return Ok((libc::EINVAL, 0, 0, 0, Vec::new(), Vec::new()));
+                        }
+                    };
                 info!("connection {} remove nodes: {:?}", id, deleted_servers_info);
                 match self.manager.delete_nodes(deleted_servers_info) {
                     None => Ok((0, 0, 0, 0, Vec::new(), Vec::new())),
@@ -266,10 +302,24 @@ impl Handler for ManagerService {
             }
             ManagerOperationType::UpdateServerStatus => {
                 info!("connection {} update server status", id);
-                match self.manager.set_server_status(
-                    String::from_utf8(path).unwrap(),
-                    bincode::deserialize(&metadata).unwrap(),
-                ) {
+                let server_address = match String::from_utf8(path) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        error!("connection {} sent invalid server address: {}", id, e);
+                        return Ok((libc::EINVAL, 0, 0, 0, Vec::new(), Vec::new()));
+                    }
+                };
+                let status = match bincode::deserialize(&metadata) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        error!(
+                            "connection {} sent malformed server status metadata: {}",
+                            id, e
+                        );
+                        return Ok((libc::EINVAL, 0, 0, 0, Vec::new(), Vec::new()));
+                    }
+                };
+                match self.manager.set_server_status(server_address, status) {
                     None => Ok((0, 0, 0, 0, Vec::new(), Vec::new())),
                     Some(e) => {
                         error!("update server status error: {}", e);
@@ -277,7 +327,78 @@ impl Handler for ManagerService {
                     }
                 }
             }
-            _ => todo!(),
+            _ => {
+                error!(
+                    "connection {} sent unsupported manager operation type: {}",
+                    id, operation_type
+                );
+                Ok((libc::ENOSYS, 0, 0, 0, Vec::new(), Vec::new()))
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rpc::server::Handler;
+
+    fn add_nodes_metadata() -> Vec<u8> {
+        bincode::serialize(&AddNodesSendMetaData {
+            new_servers_info: vec![("127.0.0.1:9000".to_string(), 100)],
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_add_nodes_is_rejected() {
+        let service = ManagerService::new(vec![]);
+        let response = service
+            .dispatch(
+                1,
+                106,
+                0,
+                Vec::new(),
+                Vec::new(),
+                add_nodes_metadata(),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.0, libc::EACCES);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_remove_nodes_is_rejected() {
+        let service = ManagerService::new(vec![]);
+        let metadata = bincode::serialize(&DeleteNodesSendMetaData {
+            deleted_servers_info: vec!["127.0.0.1:9000".to_string()],
+        })
+        .unwrap();
+        let response = service
+            .dispatch(1, 107, 0, Vec::new(), Vec::new(), metadata, false)
+            .await
+            .unwrap();
+        assert_eq!(response.0, libc::EACCES);
+    }
+
+    #[tokio::test]
+    async fn unknown_operation_type_is_rejected_without_panic() {
+        let service = ManagerService::new(vec![]);
+        let response = service
+            .dispatch(1, 999, 0, Vec::new(), Vec::new(), Vec::new(), true)
+            .await
+            .unwrap();
+        assert_eq!(response.0, libc::EINVAL);
+    }
+
+    #[tokio::test]
+    async fn malformed_add_nodes_metadata_is_rejected_without_panic() {
+        let service = ManagerService::new(vec![]);
+        let response = service
+            .dispatch(1, 106, 0, Vec::new(), Vec::new(), vec![0xff, 0x00], true)
+            .await
+            .unwrap();
+        assert_eq!(response.0, libc::EINVAL);
     }
 }

@@ -37,6 +37,7 @@ impl Handler for HelloHandler {
         path: Vec<u8>,
         data: Vec<u8>,
         _metadata: Vec<u8>,
+        _authenticated: bool,
     ) -> anyhow::Result<(i32, u32, usize, usize, Vec<u8>, Vec<u8>)> {
         // debug!("dispatch, operation_type: {}", operation_type);
         // debug!("dispatch, path: {:?}", path);

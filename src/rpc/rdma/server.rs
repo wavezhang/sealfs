@@ -118,7 +118,7 @@ async fn handle<H: Handler + std::marker::Sync + std::marker::Send + 'static>(
 ) {
     debug!("handle, id: {}", header.id);
     let response = handler
-        .dispatch(0, header.r#type, header.flags, path, data, metadata)
+        .dispatch(0, header.r#type, header.flags, path, data, metadata, false)
         .await;
     debug!("handle, response: {:?}", response);
     match response {

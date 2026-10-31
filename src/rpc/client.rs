@@ -3,13 +3,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
+    auth::{build_auth_frame, token_from_env, unix_now, AUTH_HANDSHAKE_TIMEOUT_SECS},
     callback::CallbackPool,
     connection::ClientConnection,
-    protocol::{CONNECTION_RETRY_TIMES, SEND_RETRY_TIMES},
+    protocol::{CONNECTION_RETRY_TIMES, RESPONSE_HEADER_SIZE, SEND_RETRY_TIMES},
 };
 use async_trait::async_trait;
 use dashmap::DashMap;
 use log::{error, info, warn};
+use rand::RngCore;
 use std::{marker::PhantomData, sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -20,6 +22,12 @@ pub trait StreamCreator<
 >
 {
     async fn create_stream(server_address: &str) -> Result<(R, W), String>;
+
+    /// Unix sockets are protected by peer credentials instead of the shared
+    /// secret handshake.
+    fn requires_auth() -> bool {
+        true
+    }
 }
 
 pub struct TcpStreamCreator;
@@ -53,6 +61,10 @@ pub struct UnixStreamCreator;
 impl StreamCreator<tokio::net::unix::OwnedReadHalf, tokio::net::unix::OwnedWriteHalf>
     for UnixStreamCreator
 {
+    fn requires_auth() -> bool {
+        false
+    }
+
     async fn create_stream(
         server_address: &str,
     ) -> Result<
@@ -72,6 +84,33 @@ impl StreamCreator<tokio::net::unix::OwnedReadHalf, tokio::net::unix::OwnedWrite
     }
 }
 
+async fn authenticate<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
+    read_stream: &mut R,
+    write_stream: &mut W,
+    token: &[u8],
+) -> Result<(), String> {
+    let mut nonce = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let frame = build_auth_frame(token, unix_now(), &nonce);
+    write_stream
+        .write_all(&frame)
+        .await
+        .map_err(|e| format!("send authentication handshake: {}", e))?;
+    let mut header = [0u8; RESPONSE_HEADER_SIZE];
+    tokio::time::timeout(
+        Duration::from_secs(AUTH_HANDSHAKE_TIMEOUT_SECS),
+        read_stream.read_exact(&mut header),
+    )
+    .await
+    .map_err(|_| "authentication response timed out".to_string())?
+    .map_err(|e| format!("read authentication response: {}", e))?;
+    let status = i32::from_le_bytes(header[8..12].try_into().unwrap());
+    if status != 0 {
+        return Err(format!("server rejected authentication, status {}", status));
+    }
+    Ok(())
+}
+
 pub struct RpcClient<
     R: AsyncReadExt + Unpin + std::marker::Sync + std::marker::Send + 'static,
     W: AsyncWriteExt + Unpin + std::marker::Sync + std::marker::Send + 'static,
@@ -80,6 +119,7 @@ pub struct RpcClient<
     connections: DashMap<String, Arc<ClientConnection<W, R>>>,
     pool: Arc<CallbackPool>,
     stream_creator: PhantomData<S>,
+    token: Option<Vec<u8>>,
 }
 
 impl<
@@ -100,6 +140,10 @@ impl<
     > RpcClient<R, W, S>
 {
     pub fn new() -> Self {
+        Self::new_with_token(token_from_env())
+    }
+
+    pub fn new_with_token(token: Option<Vec<u8>>) -> Self {
         let mut pool = CallbackPool::new();
         pool.init();
         let pool = Arc::new(pool);
@@ -107,6 +151,7 @@ impl<
             connections: DashMap::new(),
             pool,
             stream_creator: PhantomData,
+            token,
         }
     }
 
@@ -117,7 +162,17 @@ impl<
     pub async fn add_connection(&self, server_address: &str) -> Result<(), String> {
         for _ in 0..CONNECTION_RETRY_TIMES {
             match S::create_stream(server_address).await {
-                Ok((read_stream, write_stream)) => {
+                Ok((mut read_stream, mut write_stream)) => {
+                    if S::requires_auth() {
+                        if let Some(token) = self.token.as_ref() {
+                            if let Err(e) =
+                                authenticate(&mut read_stream, &mut write_stream, token).await
+                            {
+                                error!("authenticate to {} failed: {}", server_address, e);
+                                return Err(e);
+                            }
+                        }
+                    }
                     if self.connections.contains_key(server_address) {
                         warn!("connection already exists: {}", server_address);
                         return Ok(());
@@ -157,7 +212,20 @@ impl<
                     return Ok(());
                 }
                 match S::create_stream(server_address).await {
-                    Ok((read_stream, write_stream)) => {
+                    Ok((mut read_stream, mut write_stream)) => {
+                        if S::requires_auth() {
+                            if let Some(token) = self.token.as_ref() {
+                                if let Err(e) =
+                                    authenticate(&mut read_stream, &mut write_stream, token).await
+                                {
+                                    error!(
+                                        "reconnect authentication to {} failed: {}",
+                                        server_address, e
+                                    );
+                                    return Err(e);
+                                }
+                            }
+                        }
                         tokio::spawn(parse_response(
                             read_stream,
                             connection.clone(),

@@ -235,6 +235,7 @@ impl Handler for SealfsFused {
         path: Vec<u8>,
         _data: Vec<u8>,
         metadata: Vec<u8>,
+        _authenticated: bool,
     ) -> anyhow::Result<(i32, u32, usize, usize, Vec<u8>, Vec<u8>)> {
         match operation_type {
             MOUNT => {

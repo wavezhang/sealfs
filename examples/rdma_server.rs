@@ -26,6 +26,7 @@ impl Handler for HelloHandler {
         _path: Vec<u8>,
         _data: Vec<u8>,
         _metadata: Vec<u8>,
+        _authenticated: bool,
     ) -> anyhow::Result<(i32, u32, usize, usize, Vec<u8>, Vec<u8>)> {
         // println!("metadata: {:?}", metadata);
         // println!("data: {:?}", data);
