@@ -140,7 +140,7 @@ impl TryFrom<u32> for ManagerOperationType {
             107 => Ok(ManagerOperationType::RemoveNodes),
             108 => Ok(ManagerOperationType::UpdateServerStatus),
             109 => Ok(ManagerOperationType::FinishServer),
-            _ => panic!("Unkown value: {}", value),
+            _ => Err(()),
         }
     }
 }

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use log::{error, info, warn};
@@ -11,10 +12,15 @@ use tokio::{
     net::{TcpListener, UnixListener},
 };
 
-use super::{connection::ServerConnection, protocol::RequestHeader};
+use super::{
+    auth::{is_loopback_address, AuthState, AUTH_FRAME_SIZE, AUTH_HANDSHAKE_TIMEOUT_SECS},
+    connection::ServerConnection,
+    protocol::RequestHeader,
+};
 
 #[async_trait]
 pub trait Handler {
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch(
         &self,
         id: u32,
@@ -23,6 +29,7 @@ pub trait Handler {
         path: Vec<u8>,
         data: Vec<u8>,
         metadata: Vec<u8>,
+        authenticated: bool,
     ) -> anyhow::Result<(i32, u32, usize, usize, Vec<u8>, Vec<u8>)>;
 }
 
@@ -37,6 +44,7 @@ pub async fn handle<
     path: Vec<u8>,
     data: Vec<u8>,
     metadata: Vec<u8>,
+    authenticated: bool,
 ) {
     let response = handler
         .dispatch(
@@ -46,6 +54,7 @@ pub async fn handle<
             path.clone(),
             data,
             metadata,
+            authenticated,
         )
         .await;
     match response {
@@ -74,6 +83,33 @@ pub async fn handle<
     }
 }
 
+async fn authenticate<W: AsyncWriteExt + Unpin, R: AsyncReadExt + Unpin>(
+    auth: &AuthState,
+    connection: &ServerConnection<W, R>,
+    read_stream: &mut R,
+) -> Result<(), String> {
+    let mut frame = [0u8; AUTH_FRAME_SIZE];
+    let result = tokio::time::timeout(
+        Duration::from_secs(AUTH_HANDSHAKE_TIMEOUT_SECS),
+        read_stream.read_exact(&mut frame),
+    )
+    .await;
+    match result {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(e.to_string()),
+        Err(_) => return Err("authentication handshake timed out".to_string()),
+    }
+    match auth.verify_frame(&frame) {
+        Ok(()) => connection.send_response(0, 0, 0, 0, &[], &[]).await,
+        Err(e) => {
+            let _ = connection
+                .send_response(0, 0, libc::EACCES, 0, &[], &[])
+                .await;
+            Err(e.to_string())
+        }
+    }
+}
+
 pub async fn receive<
     H: Handler + std::marker::Sync + std::marker::Send + 'static,
     W: AsyncWriteExt + Unpin + std::marker::Sync + std::marker::Send + 'static,
@@ -82,7 +118,25 @@ pub async fn receive<
     handler: Arc<H>,
     connection: Arc<ServerConnection<W, R>>,
     mut read_stream: R,
+    auth: Option<Arc<AuthState>>,
 ) {
+    let mut authenticated = false;
+    if let Some(auth) = auth.as_ref() {
+        match authenticate(auth, &connection, &mut read_stream).await {
+            Ok(()) => {
+                authenticated = true;
+                info!("connection {} authenticated", connection.id);
+            }
+            Err(e) => {
+                warn!(
+                    "connection {} rejected: authentication failed: {}",
+                    connection.id, e
+                );
+                let _ = connection.close().await;
+                return;
+            }
+        }
+    }
     loop {
         {
             let id = connection.name_id();
@@ -105,7 +159,15 @@ pub async fn receive<
             };
             let handler = handler.clone();
             let connection = connection.clone();
-            tokio::spawn(handle(handler, connection, header, path, data, metadata));
+            tokio::spawn(handle(
+                handler,
+                connection,
+                header,
+                path,
+                data,
+                metadata,
+                authenticated,
+            ));
         }
     }
 }
@@ -125,6 +187,18 @@ impl<H: Handler + std::marker::Sync + std::marker::Send> RpcServer<H> {
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
+        let auth = AuthState::from_env();
+        if auth.is_none() && !is_loopback_address(&self.bind_address) {
+            return Err(anyhow::anyhow!(
+                "refusing to bind {} without {}: set the token or bind to a loopback address",
+                self.bind_address,
+                super::auth::AUTH_TOKEN_ENV
+            ));
+        }
+        if auth.is_some() {
+            info!("RPC authentication enabled for {}", self.bind_address);
+        }
+        let auth = auth.map(Arc::new);
         info!("Listening on {:?}", self.bind_address);
         let listener = TcpListener::bind(&self.bind_address).await?;
         let mut id = 1u32;
@@ -136,8 +210,9 @@ impl<H: Handler + std::marker::Sync + std::marker::Send> RpcServer<H> {
                     let handler = Arc::clone(&self.handler);
                     let name_id = format!("{},{}", self.bind_address, id);
                     let connection = Arc::new(ServerConnection::new(write_stream, name_id, id));
+                    let auth = auth.clone();
                     tokio::spawn(async move {
-                        receive(handler, connection, read_stream).await;
+                        receive(handler, connection, read_stream, auth).await;
                     });
                     id += 1;
                 }
@@ -170,7 +245,7 @@ impl<H: Handler + std::marker::Sync + std::marker::Send> RpcServer<H> {
                     let name_id = format!("{},{}", self.bind_address, id);
                     let connection = Arc::new(ServerConnection::new(write_stream, name_id, id));
                     tokio::spawn(async move {
-                        receive(handler, connection, read_stream).await;
+                        receive(handler, connection, read_stream, None).await;
                     });
                     id += 1;
                 }
