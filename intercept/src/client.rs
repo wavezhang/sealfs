@@ -19,9 +19,9 @@ use sealfs::common::hash_ring::HashRing;
 use sealfs::common::info_syncer::{ClientStatusMonitor, InfoSyncer};
 use sealfs::common::sender::{Sender, REQUEST_TIMEOUT};
 use sealfs::common::serialization::{
-    file_attr_as_bytes_mut, tostat, tostatx, ClusterStatus, CreateDirSendMetaData,
-    CreateFileSendMetaData, DeleteDirSendMetaData, DeleteFileSendMetaData, LinuxDirent,
-    OpenFileSendMetaData, OperationType, ReadDirSendMetaData, ReadFileSendMetaData,
+    dirent_record_len, file_attr_as_bytes_mut, read_dir_entry, tostat, tostatx, ClusterStatus,
+    CreateDirSendMetaData, CreateFileSendMetaData, DeleteDirSendMetaData, DeleteFileSendMetaData,
+    LinuxDirent, OpenFileSendMetaData, OperationType, ReadDirSendMetaData, ReadFileSendMetaData,
     TruncateFileSendMetaData,
 };
 use sealfs::rpc::client::TcpStreamCreator;
@@ -419,49 +419,52 @@ impl Client {
         }
 
         let dirp_len = dirp.len();
-        let mut dirp_ptr = dirp.as_ptr();
         let mut total = 0;
         let mut recv_total = 0;
         let mut offset = dirp_offset;
-        while recv_total < recv_data_length {
-            let dirp = unsafe { (dirp_ptr as *mut LinuxDirent).as_mut().unwrap() };
-            let r#type =
-                u8::from_le_bytes(recv_data[recv_total..recv_total + 1].try_into().unwrap());
-
-            let name_len = u16::from_le_bytes(
-                recv_data[recv_total + 1..recv_total + 3]
-                    .try_into()
-                    .unwrap(),
-            );
+        // `recv_data_length` is chosen by the server, never read past the buffer.
+        let recv = &recv_data[..std::cmp::min(recv_data_length, recv_data.len())];
+        while recv_total < recv.len() {
+            let (r#type, name) = match read_dir_entry(recv, recv_total) {
+                Some(entry) => entry,
+                None => break,
+            };
             debug!(
                 "type: {}, {}, {}, {}, {}",
                 r#type,
-                name_len,
+                name.len(),
                 recv_total,
                 offset_of!(LinuxDirent, d_name),
-                dirp_ptr as usize
+                total
             );
-            if total + offset_of!(LinuxDirent, d_name) + name_len as usize + 2 > dirp_len {
-                break;
-            }
-            dirp.d_ino = 1;
-            dirp.d_off = offset;
-            dirp.d_reclen = offset_of!(LinuxDirent, d_name) as u16 + name_len + 2;
+            // `d_reclen` must account for the name, the trailing NUL and the type byte,
+            // and the record must still fit into the caller's buffer.
+            let reclen = match dirent_record_len(
+                offset_of!(LinuxDirent, d_name),
+                2,
+                name.len(),
+                total,
+                dirp_len,
+            ) {
+                Some(reclen) => reclen,
+                None => break,
+            };
             unsafe {
-                std::ptr::copy(
-                    recv_data[recv_total + 3..recv_total + 3 + name_len as usize].as_ptr()
-                        as *const i8,
-                    dirp.d_name.as_mut_ptr(),
-                    name_len as usize,
-                );
-                let name_after = dirp.d_name.as_mut_ptr().add(name_len as usize) as *mut u8;
-                *name_after = b'\0';
-                *name_after.add(1) = r#type;
-                dirp_ptr = dirp_ptr.add(dirp.d_reclen as usize);
+                let dirent = dirp.as_mut_ptr().add(total) as *mut LinuxDirent;
+                // SAFETY: `reclen` was checked so that `total + reclen <= dirp_len`, so
+                // every write below stays inside the caller's buffer. `addr_of_mut!` is
+                // used because the struct may extend past the end of the buffer.
+                std::ptr::addr_of_mut!((*dirent).d_ino).write_unaligned(1);
+                std::ptr::addr_of_mut!((*dirent).d_off).write_unaligned(offset);
+                std::ptr::addr_of_mut!((*dirent).d_reclen).write_unaligned(reclen as u16);
+                let name_ptr = std::ptr::addr_of_mut!((*dirent).d_name) as *mut u8;
+                std::ptr::copy_nonoverlapping(name.as_ptr(), name_ptr, name.len());
+                *name_ptr.add(name.len()) = b'\0';
+                *name_ptr.add(name.len() + 1) = r#type;
             }
             offset += 1;
-            total += dirp.d_reclen as usize;
-            recv_total += (name_len + 3) as usize;
+            total += reclen;
+            recv_total += 3 + name.len();
         }
         debug!("getdents_remote {}", pathname);
         Ok((total as isize, offset))
@@ -511,40 +514,44 @@ impl Client {
         }
 
         let dirp_len = dirp.len();
-        let mut dirp_ptr = dirp.as_ptr();
         let mut total = 0;
         let mut recv_total = 0;
         let mut offset = dirp_offset;
-        while recv_total < recv_data_length {
-            let dirp = unsafe { (dirp_ptr as *mut dirent64).as_mut().unwrap() };
-            let r#type =
-                u8::from_le_bytes(recv_data[recv_total..recv_total + 1].try_into().unwrap());
-            let name_len = u16::from_le_bytes(
-                recv_data[recv_total + 1..recv_total + 3]
-                    .try_into()
-                    .unwrap(),
-            );
-            if total + offset_of!(dirent64, d_name) + name_len as usize + 1 > dirp_len {
-                break;
-            }
-            dirp.d_ino = 1;
-            dirp.d_off = offset;
-            dirp.d_reclen = offset_of!(dirent64, d_name) as u16 + name_len + 1;
-            dirp.d_type = r#type;
+        // `recv_data_length` is chosen by the server, never read past the buffer.
+        let recv = &recv_data[..std::cmp::min(recv_data_length, recv_data.len())];
+        while recv_total < recv.len() {
+            let (r#type, name) = match read_dir_entry(recv, recv_total) {
+                Some(entry) => entry,
+                None => break,
+            };
+            // `d_reclen` must account for the name and its trailing NUL, and the
+            // record must still fit into the caller's buffer.
+            let reclen = match dirent_record_len(
+                offset_of!(dirent64, d_name),
+                1,
+                name.len(),
+                total,
+                dirp_len,
+            ) {
+                Some(reclen) => reclen,
+                None => break,
+            };
             unsafe {
-                std::ptr::copy(
-                    recv_data[recv_total + 3..recv_total + 3 + name_len as usize].as_ptr()
-                        as *const i8,
-                    dirp.d_name.as_mut_ptr(),
-                    name_len as usize,
-                );
-                let name_after = dirp.d_name.as_mut_ptr().add(name_len as usize) as *mut u8;
-                *name_after = b'\0';
-                dirp_ptr = dirp_ptr.add(dirp.d_reclen as usize);
+                let dirent = dirp.as_mut_ptr().add(total) as *mut dirent64;
+                // SAFETY: `reclen` was checked so that `total + reclen <= dirp_len`, so
+                // every write below stays inside the caller's buffer. `addr_of_mut!` is
+                // used because the struct may extend past the end of the buffer.
+                std::ptr::addr_of_mut!((*dirent).d_ino).write_unaligned(1);
+                std::ptr::addr_of_mut!((*dirent).d_off).write_unaligned(offset);
+                std::ptr::addr_of_mut!((*dirent).d_reclen).write_unaligned(reclen as u16);
+                std::ptr::addr_of_mut!((*dirent).d_type).write_unaligned(r#type);
+                let name_ptr = std::ptr::addr_of_mut!((*dirent).d_name) as *mut u8;
+                std::ptr::copy_nonoverlapping(name.as_ptr(), name_ptr, name.len());
+                *name_ptr.add(name.len()) = b'\0';
             }
             offset += 1;
-            total += dirp.d_reclen as usize;
-            recv_total += (name_len + 3) as usize;
+            total += reclen;
+            recv_total += 3 + name.len();
         }
         Ok((total as isize, offset))
     }
