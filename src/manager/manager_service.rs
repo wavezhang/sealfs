@@ -183,7 +183,16 @@ impl Handler for ManagerService {
         _data: Vec<u8>,
         metadata: Vec<u8>,
     ) -> anyhow::Result<(i32, u32, usize, usize, Vec<u8>, Vec<u8>)> {
-        let r#type = ManagerOperationType::try_from(operation_type).unwrap();
+        let r#type = match ManagerOperationType::try_from(operation_type) {
+            Ok(r#type) => r#type,
+            Err(_) => {
+                error!(
+                    "connection {} unknown operation type: {}",
+                    id, operation_type
+                );
+                return Ok((libc::EINVAL, 0, 0, 0, Vec::new(), Vec::new()));
+            }
+        };
         match r#type {
             ManagerOperationType::GetClusterStatus => {
                 let status = self.manager.get_cluster_status();
@@ -238,9 +247,14 @@ impl Handler for ManagerService {
                 }
             },
             ManagerOperationType::AddNodes => {
-                let new_servers_info = bincode::deserialize::<AddNodesSendMetaData>(&metadata)
-                    .unwrap()
-                    .new_servers_info;
+                let new_servers_info = match bincode::deserialize::<AddNodesSendMetaData>(&metadata)
+                {
+                    Ok(meta_data) => meta_data.new_servers_info,
+                    Err(e) => {
+                        error!("connection {} add nodes: invalid metadata: {}", id, e);
+                        return Ok((libc::EINVAL, 0, 0, 0, Vec::new(), Vec::new()));
+                    }
+                };
                 info!("connection {} add nodes: {:?}", id, new_servers_info);
                 match self.manager.add_nodes(new_servers_info) {
                     None => Ok((0, 0, 0, 0, Vec::new(), Vec::new())),
@@ -252,9 +266,13 @@ impl Handler for ManagerService {
             }
             ManagerOperationType::RemoveNodes => {
                 let deleted_servers_info =
-                    bincode::deserialize::<DeleteNodesSendMetaData>(&metadata)
-                        .unwrap()
-                        .deleted_servers_info;
+                    match bincode::deserialize::<DeleteNodesSendMetaData>(&metadata) {
+                        Ok(meta_data) => meta_data.deleted_servers_info,
+                        Err(e) => {
+                            error!("connection {} remove nodes: invalid metadata: {}", id, e);
+                            return Ok((libc::EINVAL, 0, 0, 0, Vec::new(), Vec::new()));
+                        }
+                    };
                 info!("connection {} remove nodes: {:?}", id, deleted_servers_info);
                 match self.manager.delete_nodes(deleted_servers_info) {
                     None => Ok((0, 0, 0, 0, Vec::new(), Vec::new())),
@@ -266,10 +284,27 @@ impl Handler for ManagerService {
             }
             ManagerOperationType::UpdateServerStatus => {
                 info!("connection {} update server status", id);
-                match self.manager.set_server_status(
-                    String::from_utf8(path).unwrap(),
-                    bincode::deserialize(&metadata).unwrap(),
-                ) {
+                let address = match String::from_utf8(path) {
+                    Ok(address) => address,
+                    Err(e) => {
+                        error!(
+                            "connection {} update server status: invalid path: {}",
+                            id, e
+                        );
+                        return Ok((libc::EINVAL, 0, 0, 0, Vec::new(), Vec::new()));
+                    }
+                };
+                let status = match bincode::deserialize(&metadata) {
+                    Ok(status) => status,
+                    Err(e) => {
+                        error!(
+                            "connection {} update server status: invalid metadata: {}",
+                            id, e
+                        );
+                        return Ok((libc::EINVAL, 0, 0, 0, Vec::new(), Vec::new()));
+                    }
+                };
+                match self.manager.set_server_status(address, status) {
                     None => Ok((0, 0, 0, 0, Vec::new(), Vec::new())),
                     Some(e) => {
                         error!("update server status error: {}", e);
@@ -277,7 +312,10 @@ impl Handler for ManagerService {
                     }
                 }
             }
-            _ => todo!(),
+            // not implemented yet, answer with ENOSYS instead of panicking
+            ManagerOperationType::FinishServer => {
+                Ok((libc::ENOSYS, 0, 0, 0, Vec::new(), Vec::new()))
+            }
         }
     }
 }

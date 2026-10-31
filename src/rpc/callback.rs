@@ -19,11 +19,24 @@ use tokio::{
 
 use super::protocol::REQUEST_POOL_SIZE;
 
+/// Errors returned when a callback buffer cannot be handed out safely.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RpcError {
+    #[error("invalid callback id: {0}")]
+    InvalidCallbackId(u32),
+    #[error("requested length {requested} exceeds the registered buffer length {registered}")]
+    ResponseTooLarge { requested: usize, registered: usize },
+}
+
 pub struct OperationCallback {
     pub data: *const u8,
     pub meta_data: *const u8,
+    // lengths reported by the peer in the response header
     pub data_length: usize,
     pub meta_data_length: usize,
+    // lengths of the buffers registered by the caller, never taken from the network
+    pub data_buf_len: usize,
+    pub meta_data_buf_len: usize,
     pub request_status: libc::c_int,
     pub flags: u32,
     pub receiver: *mut Receiver<()>,
@@ -46,6 +59,8 @@ impl OperationCallback {
             meta_data: std::ptr::null(),
             data_length: 0,
             meta_data_length: 0,
+            data_buf_len: 0,
+            meta_data_buf_len: 0,
             request_status: 0,
             flags: 0,
             receiver: Box::into_raw(Box::new(receiver)),
@@ -120,6 +135,10 @@ impl CallbackPool {
                     unsafe { &mut *(self.callbacks[id as usize] as *mut OperationCallback) };
                 callback.data = rsp_data.as_ptr();
                 callback.meta_data = rsp_meta_data.as_ptr();
+                // Remember the real capacity of the caller's buffers. Response headers are
+                // attacker controlled, so the lengths they carry must never be trusted.
+                callback.data_buf_len = rsp_data.len();
+                callback.meta_data_buf_len = rsp_meta_data.len();
 
                 // codes above can be reordered, so we don't use AcqRel. Maybe directly use fetch and store is better.
                 let batch = self.batch[id as usize].fetch_add(1, Ordering::Release);
@@ -132,12 +151,30 @@ impl CallbackPool {
         }
     }
 
+    /// Look up a callback by the id carried in a response header.
+    fn callback(&self, id: u32) -> Result<&OperationCallback, RpcError> {
+        let callback = *self
+            .callbacks
+            .get(id as usize)
+            .ok_or(RpcError::InvalidCallbackId(id))?;
+        // SAFETY: every entry of `callbacks` is a leaked Box that lives until `free()`,
+        // and `free()` is only called when the pool is closed.
+        Ok(unsafe { &*callback })
+    }
+
     pub fn lock_if_not_timeout(&self, batch: u32, id: u32) -> Result<(), String> {
-        let now_batch = self.batch[id as usize].load(std::sync::atomic::Ordering::Acquire);
+        let now_batch = self
+            .batch
+            .get(id as usize)
+            .ok_or_else(|| format!("invalid callback id: {}", id))?
+            .load(std::sync::atomic::Ordering::Acquire);
         if batch != now_batch {
             return Err("wrong batch, already timed out".into());
         }
-        if self.callback_status[id as usize]
+        if self
+            .callback_status
+            .get(id as usize)
+            .ok_or_else(|| format!("invalid callback id: {}", id))?
             .compare_exchange(
                 1,
                 0,
@@ -152,18 +189,54 @@ impl CallbackPool {
         }
     }
 
+    /// Borrow the data buffer registered for `id`.
+    ///
+    /// `data_length` comes from the response header, so it is only accepted when it
+    /// fits into the buffer that the caller registered. The returned slice has the
+    /// lifetime of the pool, callers must keep the registered buffer alive until the
+    /// callback is completed.
     #[allow(clippy::mut_from_ref)]
-    pub fn get_data_ref(&self, id: u32, data_length: usize) -> &mut [u8] {
-        let callback = self.callbacks[id as usize];
-        unsafe { std::slice::from_raw_parts_mut((*callback).data as *mut u8, data_length) }
+    pub fn get_data_ref(&self, id: u32, data_length: usize) -> Result<&mut [u8], RpcError> {
+        let callback = self.callback(id)?;
+        if data_length > callback.data_buf_len {
+            return Err(RpcError::ResponseTooLarge {
+                requested: data_length,
+                registered: callback.data_buf_len,
+            });
+        }
+        if data_length == 0 {
+            return Ok(&mut []);
+        }
+        // SAFETY: `data`/`data_buf_len` are always written together in `register_callback`,
+        // and `data_length <= data_buf_len` has been checked above, so the pointer is
+        // non-null and valid for `data_length` bytes.
+        Ok(unsafe { std::slice::from_raw_parts_mut(callback.data as *mut u8, data_length) })
     }
 
+    /// Borrow the metadata buffer registered for `id`. See [`Self::get_data_ref`].
     #[allow(clippy::mut_from_ref)]
-    pub fn get_meta_data_ref(&self, id: u32, meta_data_length: usize) -> &mut [u8] {
-        let callback = self.callbacks[id as usize];
-        unsafe {
-            std::slice::from_raw_parts_mut((*callback).meta_data as *mut u8, meta_data_length)
+    pub fn get_meta_data_ref(
+        &self,
+        id: u32,
+        meta_data_length: usize,
+    ) -> Result<&mut [u8], RpcError> {
+        let callback = self.callback(id)?;
+        if meta_data_length > callback.meta_data_buf_len {
+            return Err(RpcError::ResponseTooLarge {
+                requested: meta_data_length,
+                registered: callback.meta_data_buf_len,
+            });
         }
+        if meta_data_length == 0 {
+            return Ok(&mut []);
+        }
+        // SAFETY: `meta_data`/`meta_data_buf_len` are always written together in
+        // `register_callback`, and `meta_data_length <= meta_data_buf_len` has been
+        // checked above, so the pointer is non-null and valid for `meta_data_length`
+        // bytes.
+        Ok(unsafe {
+            std::slice::from_raw_parts_mut(callback.meta_data as *mut u8, meta_data_length)
+        })
     }
 
     pub async fn response(
@@ -175,13 +248,22 @@ impl CallbackPool {
         data_lenght: usize,
     ) -> Result<(), String> {
         {
-            let callback = unsafe { &mut *(self.callbacks[id as usize] as *mut OperationCallback) };
+            let callback = match self.callbacks.get(id as usize) {
+                Some(callback) => unsafe { &mut *(*callback as *mut OperationCallback) },
+                None => return Err(format!("invalid callback id: {}", id)),
+            };
             callback.request_status = status;
             callback.flags = flags;
             callback.meta_data_length = meta_data_length;
             callback.data_length = data_lenght;
         }
-        match self.senders[id as usize].send(()).await {
+        match self
+            .senders
+            .get(id as usize)
+            .ok_or_else(|| format!("invalid callback id: {}", id))?
+            .send(())
+            .await
+        {
             Ok(_) => Ok(()),
             Err(e) => Err(format!("send callback failed: {}", e)),
         }
@@ -196,34 +278,27 @@ impl CallbackPool {
     ) -> Result<(i32, u32, usize, usize), String> {
         let receiver =
             unsafe { (*(self.callbacks[id as usize] as *mut OperationCallback)).get_receiver() };
-        let result = timeout(req_timeout, receiver.recv()).await;
-        let is_ok = match result {
-            Ok(r) => match r {
-                Some(_) => true,
-                None => panic!("wait_for_callback error"),
-            },
-            Err(_) => {
-                match self.callback_status[id as usize].compare_exchange(
-                    1,
-                    0,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => false,
-                    Err(_) => {
-                        // This means that the response has been received, and signal has been sent.
-                        match timeout(req_timeout, receiver.recv()).await {
-                            Ok(r) => match r {
-                                Some(_) => true,
-                                None => panic!("wait_for_callback error"),
-                            },
-                            Err(_) => {
-                                panic!("unexpected wait_for_callback timeout")
-                            }
-                        }
+        let is_ok = match timeout(req_timeout, receiver.recv()).await {
+            Ok(Some(_)) => true,
+            // the sender was dropped while the pool is being torn down
+            Ok(None) => false,
+            Err(_) => match self.callback_status[id as usize].compare_exchange(
+                1,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => false,
+                Err(_) => {
+                    // This means that the response has been received, and signal has been sent.
+                    match timeout(req_timeout, receiver.recv()).await {
+                        Ok(Some(_)) => true,
+                        // treat a closed channel or a second timeout as a failed callback
+                        // instead of panicking in the response parsing task
+                        Ok(None) | Err(_) => false,
                     }
                 }
-            }
+            },
         };
         match is_ok {
             true => {
@@ -256,7 +331,7 @@ unsafe impl std::marker::Send for CallbackPool {}
 #[allow(unused)]
 #[cfg(test)]
 mod tests {
-    use super::{CallbackPool, OperationCallback};
+    use super::{CallbackPool, OperationCallback, RpcError};
     use core::time;
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_register_callback() {
@@ -284,8 +359,8 @@ mod tests {
             .await;
         match result {
             Ok((batch, id)) => assert_eq!(
-                pool.get_meta_data_ref(id, recv_meta_data.len()),
-                &mut recv_meta_data
+                pool.get_meta_data_ref(id, recv_meta_data.len()).unwrap(),
+                recv_meta_data.as_mut_slice()
             ),
             Err(_) => assert!(false),
         }
@@ -301,9 +376,69 @@ mod tests {
             .register_callback(&mut recv_meta_data, &mut recv_data)
             .await;
         match result {
-            Ok((batch, id)) => assert_eq!(pool.get_data_ref(id, recv_data.len()), &mut recv_data),
+            Ok((batch, id)) => assert_eq!(
+                pool.get_data_ref(id, recv_data.len()).unwrap(),
+                recv_data.as_mut_slice()
+            ),
             Err(_) => assert!(false),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_get_data_ref_rejects_oversized_length() {
+        let mut pool = CallbackPool::new();
+        pool.init();
+        let mut recv_meta_data = vec![0u8; 8];
+        let mut recv_data = vec![0u8; 1024];
+        let (_, id) = pool
+            .register_callback(&mut recv_meta_data, &mut recv_data)
+            .await
+            .unwrap();
+        // a malicious peer advertises a length larger than the registered buffer
+        assert_eq!(
+            pool.get_data_ref(id, recv_data.len() + 1),
+            Err(RpcError::ResponseTooLarge {
+                requested: recv_data.len() + 1,
+                registered: recv_data.len(),
+            })
+        );
+        assert_eq!(
+            pool.get_meta_data_ref(id, usize::MAX),
+            Err(RpcError::ResponseTooLarge {
+                requested: usize::MAX,
+                registered: recv_meta_data.len(),
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_get_data_ref_rejects_invalid_id() {
+        let mut pool = CallbackPool::new();
+        pool.init();
+        let invalid_id = u32::MAX;
+        assert_eq!(
+            pool.get_data_ref(invalid_id, 1),
+            Err(RpcError::InvalidCallbackId(invalid_id))
+        );
+        assert_eq!(
+            pool.get_meta_data_ref(invalid_id, 1),
+            Err(RpcError::InvalidCallbackId(invalid_id))
+        );
+        assert!(pool.lock_if_not_timeout(1, invalid_id).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_get_ref_zero_length() {
+        let mut pool = CallbackPool::new();
+        pool.init();
+        let mut recv_meta_data: Vec<u8> = vec![];
+        let mut recv_data: Vec<u8> = vec![];
+        let (_, id) = pool
+            .register_callback(&mut recv_meta_data, &mut recv_data)
+            .await
+            .unwrap();
+        assert!(pool.get_data_ref(id, 0).unwrap().is_empty());
+        assert!(pool.get_meta_data_ref(id, 0).unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

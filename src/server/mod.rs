@@ -39,6 +39,34 @@ pub enum ServerError {
     ParseHeaderError,
 }
 
+/// Decode bincode metadata received from the network. A malformed payload is a
+/// protocol error (`EINVAL`), never a panic in the per-connection task.
+fn parse_metadata<T: serde::de::DeserializeOwned>(metadata: &[u8]) -> Result<T, i32> {
+    bincode::deserialize(metadata).map_err(|e| {
+        error!("Invalid request metadata: {}", e);
+        libc::EINVAL
+    })
+}
+
+/// Decode the file path of a request. Paths arrive as raw network bytes and are
+/// not guaranteed to be valid UTF-8.
+fn parse_file_path(path: &[u8]) -> Result<&str, i32> {
+    std::str::from_utf8(path).map_err(|e| {
+        error!("Invalid file path: {}", e);
+        libc::EINVAL
+    })
+}
+
+/// Deserialize request metadata, answering the peer with `EINVAL` on failure.
+macro_rules! metadata_or_einval {
+    ($ty:ty, $metadata:expr) => {
+        match parse_metadata::<$ty>($metadata) {
+            Ok(value) => value,
+            Err(status) => return Ok((status, 0, 0, 0, Vec::new(), Vec::new())),
+        }
+    };
+}
+
 pub async fn sync_cluster_status(engine: Arc<DistributedEngine<FileEngine>>) {
     loop {
         {
@@ -392,7 +420,10 @@ where
             }
         };
 
-        let file_path = unsafe { std::str::from_utf8_unchecked(&path) };
+        let file_path = match parse_file_path(&path) {
+            Ok(file_path) => file_path,
+            Err(status) => return Ok((status, 0, 0, 0, Vec::new(), Vec::new())),
+        };
 
         // this lock is deprecated, and always return false
         let _lock =
@@ -430,7 +461,7 @@ where
             OperationType::CreateFile => {
                 debug!("{} Create File: path: {}", self.engine.address, file_path);
                 let meta_data_unwraped: CreateFileSendMetaData =
-                    bincode::deserialize(&metadata).unwrap();
+                    metadata_or_einval!(CreateFileSendMetaData, &metadata);
                 let (return_meta_data, status) = match self
                     .engine
                     .create_file(
@@ -467,7 +498,7 @@ where
             OperationType::CreateDir => {
                 debug!("{} Create Dir: path: {}", self.engine.address, file_path);
                 let meta_data_unwraped: CreateDirSendMetaData =
-                    bincode::deserialize(&metadata).unwrap();
+                    metadata_or_einval!(CreateDirSendMetaData, &metadata);
                 let (return_meta_data, status) = match self
                     .engine
                     .create_dir(
@@ -521,7 +552,7 @@ where
             OperationType::OpenFile => {
                 debug!("{} Open File {}", self.engine.address, file_path);
                 let meta_data_unwraped: OpenFileSendMetaData =
-                    bincode::deserialize(&metadata).unwrap();
+                    metadata_or_einval!(OpenFileSendMetaData, &metadata);
                 let status = match self.engine.open_file(
                     file_path,
                     meta_data_unwraped.flags,
@@ -543,7 +574,7 @@ where
             }
             OperationType::ReadDir => {
                 debug!("{} Read Dir: {}", self.engine.address, file_path);
-                let md: ReadDirSendMetaData = bincode::deserialize(&metadata).unwrap();
+                let md: ReadDirSendMetaData = metadata_or_einval!(ReadDirSendMetaData, &metadata);
                 let (data, status) = match self.engine.read_dir(file_path, md.size, md.offset) {
                     Ok(value) => (value, 0),
                     Err(e) => {
@@ -561,7 +592,7 @@ where
             }
             OperationType::ReadFile => {
                 debug!("{} Read File: {}", self.engine.address, file_path);
-                let md: ReadFileSendMetaData = bincode::deserialize(&metadata).unwrap();
+                let md: ReadFileSendMetaData = metadata_or_einval!(ReadFileSendMetaData, &metadata);
                 let (data, status) = match self.engine.read_file(file_path, md.size, md.offset) {
                     Ok(value) => (value, 0),
                     Err(e) => {
@@ -579,7 +610,8 @@ where
             }
             OperationType::WriteFile => {
                 debug!("{} Write File: {}", self.engine.address, file_path);
-                let md: WriteFileSendMetaData = bincode::deserialize(&metadata).unwrap();
+                let md: WriteFileSendMetaData =
+                    metadata_or_einval!(WriteFileSendMetaData, &metadata);
                 let (status, size) =
                     match self
                         .engine
@@ -609,7 +641,7 @@ where
             OperationType::DeleteFile => {
                 debug!("{} Delete File: {}", self.engine.address, file_path);
                 let meta_data_unwraped: DeleteFileSendMetaData =
-                    bincode::deserialize(&metadata).unwrap();
+                    metadata_or_einval!(DeleteFileSendMetaData, &metadata);
                 let status = match self
                     .engine
                     .delete_file(metadata, file_path, &meta_data_unwraped.name)
@@ -632,7 +664,7 @@ where
             OperationType::DeleteDir => {
                 debug!("{} Delete Dir: {}", self.engine.address, file_path);
                 let meta_data_unwraped: DeleteDirSendMetaData =
-                    bincode::deserialize(&metadata).unwrap();
+                    metadata_or_einval!(DeleteDirSendMetaData, &metadata);
                 let status = match self
                     .engine
                     .delete_dir(metadata, file_path, &meta_data_unwraped.name)
@@ -654,7 +686,8 @@ where
             }
             OperationType::DirectoryAddEntry => {
                 debug!("{} Directory Add Entry: {}", self.engine.address, file_path);
-                let md: DirectoryEntrySendMetaData = bincode::deserialize(&metadata).unwrap();
+                let md: DirectoryEntrySendMetaData =
+                    metadata_or_einval!(DirectoryEntrySendMetaData, &metadata);
                 Ok((
                     self.engine
                         .directory_add_entry(file_path, md.file_name, md.file_type),
@@ -670,7 +703,8 @@ where
                     "{} Directory Delete Entry: {}",
                     self.engine.address, file_path
                 );
-                let md: DirectoryEntrySendMetaData = bincode::deserialize(&metadata).unwrap();
+                let md: DirectoryEntrySendMetaData =
+                    metadata_or_einval!(DirectoryEntrySendMetaData, &metadata);
                 Ok((
                     self.engine
                         .directory_delete_entry(file_path, md.file_name, md.file_type),
@@ -683,7 +717,8 @@ where
             }
             OperationType::TruncateFile => {
                 debug!("{} Truncate File: {}", self.engine.address, file_path);
-                let md: TruncateFileSendMetaData = bincode::deserialize(&metadata).unwrap();
+                let md: TruncateFileSendMetaData =
+                    metadata_or_einval!(TruncateFileSendMetaData, &metadata);
                 let status =
                     match self.engine.truncate_file(file_path, md.length) {
                         Ok(()) => 0,
@@ -699,9 +734,15 @@ where
             }
             OperationType::CheckFile => {
                 info!("{} Checkout File: {}", self.engine.address, file_path);
-                let file_attr = bytes_as_file_attr(&metadata);
+                let file_attr = match bytes_as_file_attr(&metadata) {
+                    Some(file_attr) => file_attr,
+                    None => {
+                        error!("Checkout File: invalid file attr, path: {}", file_path);
+                        return Ok((libc::EINVAL, 0, 0, 0, Vec::new(), Vec::new()));
+                    }
+                };
                 let status =
-                    match self.engine.check_file(file_path, file_attr) {
+                    match self.engine.check_file(file_path, &file_attr) {
                         Ok(()) => 0,
                         Err(e) => {
                             info!(
@@ -715,9 +756,15 @@ where
             }
             OperationType::CheckDir => {
                 info!("{} Checkout Dir: {}", self.engine.address, file_path);
-                let file_attr = bytes_as_file_attr(&metadata);
+                let file_attr = match bytes_as_file_attr(&metadata) {
+                    Some(file_attr) => file_attr,
+                    None => {
+                        error!("Checkout Dir: invalid file attr, path: {}", file_path);
+                        return Ok((libc::EINVAL, 0, 0, 0, Vec::new(), Vec::new()));
+                    }
+                };
                 let status =
-                    match self.engine.check_dir(file_path, file_attr) {
+                    match self.engine.check_dir(file_path, &file_attr) {
                         Ok(()) => 0,
                         Err(e) => {
                             info!(
@@ -735,7 +782,7 @@ where
                     self.engine.address, file_path
                 );
                 let meta_data_unwraped: CreateDirSendMetaData =
-                    bincode::deserialize(&metadata).unwrap();
+                    metadata_or_einval!(CreateDirSendMetaData, &metadata);
                 let (return_meta_data, status) = match self
                     .engine
                     .create_dir_no_parent(file_path, meta_data_unwraped.mode)
@@ -767,7 +814,7 @@ where
                     self.engine.address, file_path
                 );
                 let meta_data_unwraped: CreateFileSendMetaData =
-                    bincode::deserialize(&metadata).unwrap();
+                    metadata_or_einval!(CreateFileSendMetaData, &metadata);
                 let (return_meta_data, status) = match self.engine.create_file_no_parent(
                     file_path,
                     meta_data_unwraped.flags,
@@ -838,7 +885,7 @@ where
             OperationType::CreateVolume => {
                 info!("{} Create Volume", self.engine.address);
                 let meta_data_unwraped: CreateVolumeSendMetaData =
-                    bincode::deserialize(&metadata).unwrap();
+                    metadata_or_einval!(CreateVolumeSendMetaData, &metadata);
                 info!("Create Volume: {:?}, id: {}", file_path, id);
                 if file_path.is_empty()
                     || file_path.len() > 255
@@ -856,7 +903,7 @@ where
                         info!(
                             "Create Volume Failed: {:?}, path: {}, operation_type: {}, flags: {}",
                             status_to_string(e),
-                            std::str::from_utf8(path.as_slice()).unwrap(),
+                            file_path,
                             operation_type,
                             flags
                         );
@@ -888,7 +935,13 @@ where
             }
             OperationType::ListVolumes => {
                 info!("{} List Volume", self.engine.address);
-                let return_meta_data = self.engine.meta_engine.list_volumes().unwrap();
+                let return_meta_data = match self.engine.meta_engine.list_volumes() {
+                    Ok(return_meta_data) => return_meta_data,
+                    Err(e) => {
+                        error!("List Volume Failed: {:?}", e);
+                        return Ok((e, 0, 0, 0, Vec::new(), Vec::new()));
+                    }
+                };
                 return Ok((
                     0,
                     0,
@@ -914,7 +967,7 @@ where
                         info!(
                             "Delete Volume Failed: {:?}, path: {}, operation_type: {}, flags: {}",
                             status_to_string(e),
-                            std::str::from_utf8(path.as_slice()).unwrap(),
+                            file_path,
                             operation_type,
                             flags
                         );
@@ -939,7 +992,7 @@ where
                         info!(
                             "Clean Volume Failed: {:?}, path: {}, operation_type: {}, flags: {}",
                             status_to_string(e),
-                            std::str::from_utf8(path.as_slice()).unwrap(),
+                            file_path,
                             operation_type,
                             flags
                         );
@@ -948,6 +1001,61 @@ where
                 };
                 return Ok((status, 0, 0, 0, Vec::new(), Vec::new()));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_file_path, parse_metadata};
+    use crate::common::serialization::{
+        CreateFileSendMetaData, ManagerOperationType, OperationType,
+    };
+
+    #[test]
+    fn test_parse_file_path_rejects_non_utf8() {
+        assert_eq!(parse_file_path(b"/volume/dir/file"), Ok("/volume/dir/file"));
+        assert_eq!(parse_file_path(b""), Ok(""));
+        // 0xff is never valid UTF-8, 0xc3 0x28 is a truncated two byte sequence
+        assert_eq!(parse_file_path(&[0xff]), Err(libc::EINVAL));
+        assert_eq!(parse_file_path(&[b'/', 0x80, b'f']), Err(libc::EINVAL));
+        assert_eq!(parse_file_path(&[0xc3, 0x28]), Err(libc::EINVAL));
+    }
+
+    #[test]
+    fn test_parse_metadata_rejects_truncated_payload() {
+        let md = CreateFileSendMetaData {
+            mode: 0o644,
+            umask: 0o022,
+            flags: 0,
+            name: "file".to_string(),
+        };
+        let bytes = bincode::serialize(&md).unwrap();
+        assert!(parse_metadata::<CreateFileSendMetaData>(&bytes).is_ok());
+
+        // empty, truncated and single byte payloads must be reported as EINVAL
+        assert_eq!(
+            parse_metadata::<CreateFileSendMetaData>(&[]),
+            Err(libc::EINVAL)
+        );
+        assert_eq!(
+            parse_metadata::<CreateFileSendMetaData>(&bytes[..1]),
+            Err(libc::EINVAL)
+        );
+        assert_eq!(
+            parse_metadata::<CreateFileSendMetaData>(&bytes[..bytes.len() - 1]),
+            Err(libc::EINVAL)
+        );
+    }
+
+    #[test]
+    fn test_unknown_operation_type_is_rejected() {
+        assert_eq!(OperationType::try_from(1u32).map(u32::from), Ok(1));
+        for value in [25u32, 102, u32::MAX] {
+            assert!(OperationType::try_from(value).is_err());
+        }
+        for value in [0u32, 110, u32::MAX] {
+            assert!(ManagerOperationType::try_from(value).is_err());
         }
     }
 }
