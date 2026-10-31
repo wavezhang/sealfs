@@ -2,16 +2,70 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use log::{error, info, warn};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, UnixListener},
+    net::{TcpListener, UnixListener, UnixStream},
 };
 
 use super::{connection::ServerConnection, protocol::RequestHeader};
+
+/// Restrict the unix socket to its owner. The socket is the only
+/// authentication boundary for local management operations, so it must never
+/// be reachable by other local users.
+fn restrict_unix_socket(path: &str) -> std::io::Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+/// UID of the process on the other end of a unix socket.
+#[cfg(target_os = "linux")]
+fn unix_peer_uid(stream: &UnixStream) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret == 0 {
+        Some(cred.uid)
+    } else {
+        None
+    }
+}
+
+/// Whether the connected peer is allowed to use the local socket. Only the
+/// process owner may connect.
+fn unix_peer_allowed(stream: &UnixStream) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        match unix_peer_uid(stream) {
+            Some(uid) => uid == nix::unistd::geteuid().as_raw(),
+            // Without peer credentials we cannot prove who connected; refuse.
+            None => false,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Peer credentials are not available here; the 0600 socket mode is the
+        // only protection, so accept only when the socket is not shared.
+        let _ = stream;
+        true
+    }
+}
 
 #[async_trait]
 pub trait Handler {
@@ -160,10 +214,28 @@ impl<H: Handler + std::marker::Sync + std::marker::Send> RpcServer<H> {
                 ));
             }
         };
+        // The unix socket is the only gate for local management calls: keep it
+        // private to the owning user even when the parent directory is shared.
+        if let Err(e) = restrict_unix_socket(&self.bind_address) {
+            return Err(anyhow::anyhow!(
+                "Failed to restrict permissions on unix socket {:?}, error is {}",
+                self.bind_address,
+                e
+            ));
+        }
         let mut id = 1u32;
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
+                    if !unix_peer_allowed(&stream) {
+                        warn!(
+                            "Rejecting local connection {id} on {:?}: peer is not the socket owner",
+                            self.bind_address
+                        );
+                        drop(stream);
+                        id += 1;
+                        continue;
+                    }
                     let (read_stream, write_stream) = stream.into_split();
                     info!("Connection {id} accepted");
                     let handler = Arc::clone(&self.handler);
@@ -179,5 +251,36 @@ impl<H: Handler + std::marker::Sync + std::marker::Send> RpcServer<H> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restrict_unix_socket_is_owner_only() {
+        let path = std::env::temp_dir().join(format!(
+            "sealfs-unix-socket-mode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"").unwrap();
+        restrict_unix_socket(path.to_str().unwrap()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            mode, 0o600,
+            "unix socket must be reachable by its owner only"
+        );
+    }
+
+    #[tokio::test]
+    async fn unix_peer_allowed_accepts_same_process() {
+        let (client, _server) = UnixStream::pair().unwrap();
+        assert!(unix_peer_allowed(&client));
     }
 }
