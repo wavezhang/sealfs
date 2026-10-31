@@ -14,13 +14,21 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+/// Byte offset of `$field` inside `$ty`.
+///
+/// The offset is computed from the address of the field on an uninitialized
+/// value, so no memory is ever read or written. The previous implementation
+/// dereferenced a null pointer and returned `real_offset - 1`, which made every
+/// caller under-estimate the size of a directory entry (`dirent64` by two bytes).
 #[macro_export]
 macro_rules! offset_of {
-    ($ty:ty, $field:ident) => {
-        //  Undefined Behavior: dereferences a null pointer.
-        //  Undefined Behavior: accesses field outside of valid memory area.
-        unsafe { &(*(0 as *const $ty)).$field as *const _ as usize - 1 }
-    };
+    ($ty:ty, $field:ident) => {{
+        let uninit = ::std::mem::MaybeUninit::<$ty>::uninit();
+        let base = uninit.as_ptr();
+        // SAFETY: `addr_of!` only computes the address of the field, it never
+        // dereferences the (uninitialized) value.
+        unsafe { (::std::ptr::addr_of!((*base).$field) as usize) - (base as usize) }
+    }};
 }
 
 pub enum OperationType {
@@ -777,6 +785,56 @@ pub struct LinuxDirent {
     pub d_name: [i8; 256],
 }
 
+/// Longest directory entry name that can be emitted. `d_name` holds 256 bytes and
+/// every record needs a trailing NUL, plus a type byte for `linux_dirent`.
+pub const MAX_DIRENT_NAME_LEN: usize = 255;
+
+/// Decode one `(type, name)` record out of a `read_dir` response payload.
+///
+/// The payload is produced by the server, so every offset is checked before use.
+pub fn read_dir_entry(data: &[u8], offset: usize) -> Option<(u8, &[u8])> {
+    let name_start = offset.checked_add(3)?;
+    if name_start > data.len() {
+        return None;
+    }
+    let r#type = data[offset];
+    let name_len = u16::from_le_bytes([data[offset + 1], data[offset + 2]]) as usize;
+    if name_len > MAX_DIRENT_NAME_LEN {
+        return None;
+    }
+    let name_end = name_start.checked_add(name_len)?;
+    if name_end > data.len() {
+        return None;
+    }
+    Some((r#type, &data[name_start..name_end]))
+}
+
+/// Length of one directory record (`d_reclen`), provided it still fits into the
+/// caller's buffer.
+///
+/// `name_offset` is the offset of `d_name` in the record layout, `trailer` the
+/// number of bytes written after the name (`\0` plus `d_type` for `linux_dirent`,
+/// only `\0` for `dirent64`) and `total` the number of bytes already emitted.
+pub fn dirent_record_len(
+    name_offset: usize,
+    trailer: usize,
+    name_len: usize,
+    total: usize,
+    buf_len: usize,
+) -> Option<usize> {
+    if name_len > MAX_DIRENT_NAME_LEN {
+        return None;
+    }
+    let reclen = name_offset.checked_add(name_len)?.checked_add(trailer)?;
+    if reclen > u16::MAX as usize {
+        return None;
+    }
+    if total.checked_add(reclen)? > buf_len {
+        return None;
+    }
+    Some(reclen)
+}
+
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub struct WriteFileSendMetaData {
     pub offset: i64,
@@ -890,5 +948,113 @@ impl Display for Volume {
             "Volume {{ name: {}, size: {}, used_size: {} }}",
             self.name, self.size, self.used_size
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libc::dirent64;
+
+    #[test]
+    fn test_offset_of_linux_dirent() {
+        assert_eq!(offset_of!(LinuxDirent, d_ino), 0);
+        assert_eq!(offset_of!(LinuxDirent, d_off), 8);
+        assert_eq!(offset_of!(LinuxDirent, d_reclen), 16);
+        assert_eq!(offset_of!(LinuxDirent, d_name), 18);
+    }
+
+    #[test]
+    fn test_offset_of_dirent64() {
+        assert_eq!(offset_of!(dirent64, d_type), 18);
+        assert_eq!(offset_of!(dirent64, d_name), 19);
+    }
+
+    #[test]
+    fn test_read_dir_entry_valid() {
+        let mut data = Vec::new();
+        data.push(4u8); // d_type
+        data.extend_from_slice(&2u16.to_le_bytes());
+        data.extend_from_slice(b"ab");
+        data.push(8u8);
+        data.extend_from_slice(&0u16.to_le_bytes());
+
+        assert_eq!(read_dir_entry(&data, 0), Some((4, &b"ab"[..])));
+        assert_eq!(read_dir_entry(&data, 5), Some((8, &b""[..])));
+        assert_eq!(read_dir_entry(&data, data.len()), None);
+    }
+
+    #[test]
+    fn test_read_dir_entry_truncated() {
+        // Header alone is not enough for a record.
+        assert_eq!(read_dir_entry(&[1, 0], 0), None);
+        assert_eq!(read_dir_entry(&[], 0), None);
+        assert_eq!(read_dir_entry(&[1, 0, 0], 0), Some((1, &b""[..])));
+
+        // Name length points past the end of the payload.
+        let mut data = vec![1u8];
+        data.extend_from_slice(&4u16.to_le_bytes());
+        data.extend_from_slice(b"ab");
+        assert_eq!(read_dir_entry(&data, 0), None);
+
+        // Offset beyond the payload or overflowing `offset + 3`.
+        assert_eq!(read_dir_entry(&data, data.len() + 1), None);
+        assert_eq!(read_dir_entry(&data, usize::MAX), None);
+    }
+
+    #[test]
+    fn test_read_dir_entry_rejects_oversized_name() {
+        let mut data = vec![1u8];
+        data.extend_from_slice(&(MAX_DIRENT_NAME_LEN as u16 + 1).to_le_bytes());
+        data.extend_from_slice(&vec![b'a'; MAX_DIRENT_NAME_LEN + 1]);
+        assert_eq!(read_dir_entry(&data, 0), None);
+    }
+
+    #[test]
+    fn test_dirent_record_len_boundaries() {
+        let name_offset = offset_of!(LinuxDirent, d_name);
+        let trailer = 2;
+
+        // Exact fit: name_offset + name_len + trailer == buf_len.
+        let reclen = name_offset + 4 + trailer;
+        assert_eq!(
+            dirent_record_len(name_offset, trailer, 4, 0, reclen),
+            Some(reclen)
+        );
+
+        // One byte short: the record no longer fits.
+        assert_eq!(
+            dirent_record_len(name_offset, trailer, 4, 0, reclen - 1),
+            None
+        );
+
+        // `total` offsets the record inside the buffer.
+        assert_eq!(
+            dirent_record_len(name_offset, trailer, 4, reclen, reclen * 2),
+            Some(reclen)
+        );
+        assert_eq!(
+            dirent_record_len(name_offset, trailer, 4, reclen, reclen * 2 - 1),
+            None
+        );
+
+        // Name length cap.
+        assert!(
+            dirent_record_len(name_offset, trailer, MAX_DIRENT_NAME_LEN, 0, usize::MAX).is_some()
+        );
+        assert_eq!(
+            dirent_record_len(name_offset, trailer, MAX_DIRENT_NAME_LEN + 1, 0, usize::MAX),
+            None
+        );
+
+        // `d_reclen` must stay representable as u16 and the arithmetic must not wrap.
+        assert_eq!(
+            dirent_record_len(u16::MAX as usize, 1, 1, 0, usize::MAX),
+            None
+        );
+        assert_eq!(
+            dirent_record_len(name_offset, trailer, 4, usize::MAX, usize::MAX),
+            None
+        );
     }
 }
